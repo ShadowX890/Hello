@@ -789,6 +789,14 @@ local roomInfo    = nil
 local roomName    = nil
 local roomStatus  = "Idle"
 local roomBusy    = false
+local roomDone    = false   -- true once we made / joined a room, so auto stops
+
+-- Room gates only exist in the Lobby. Once the match map is loaded we are
+-- inside a room and must not ask for another one.
+local function inLobby()
+    if workspace:FindFirstChild("Map") then return false end
+    return workspace:FindFirstChild("Gate") ~= nil
+end
 
 -- ── Gate touching ─────────────────────────────────────────────
 -- workspace.Gate.RoomN.Gate holds a TouchInterest, so firetouchinterest
@@ -951,7 +959,8 @@ local function createRoom()
 
     if roomMode == "Tutorial" then
         pcall(function() GateRemote:FireServer("CreateRoom", roomName, "Tutorial", 1) end)
-        roomStatus = ("Created %s (Tutorial)"):format(roomName)
+        roomStatus = ("Created %s (Tutorial) — auto stopped"):format(roomName)
+        roomDone = true
         return true
     end
 
@@ -963,8 +972,9 @@ local function createRoom()
     pcall(function()
         GateRemote:FireServer("CreateRoom", roomName, roomMode, size, slot)
     end)
-    roomStatus = ("Created %s (%s, %d players, slot %d)")
+    roomStatus = ("Created %s (%s, %d players, slot %d) — auto stopped")
         :format(roomName, roomMode, size, slot)
+    roomDone = true
     return true
 end
 
@@ -1035,14 +1045,37 @@ if GateRemote then
     end)
 end
 
--- Auto Create Room: do the whole flow on its own
+-- Auto Create Room: do the whole flow once, then stay quiet.
+-- It stops as soon as a room is made or the match map appears (= we are inside
+-- a room already), and arms itself again only after returning to the Lobby.
+local roomSeenMatch = false   -- we actually got into a room at least once
+
 task.spawn(function()
     while true do
-        if autoRoomEnabled and GateRemote and not roomBusy then
+        if not inLobby() then
+            -- inside a room / match: never ask for another one
+            if not roomDone then roomStatus = "In a room — auto stopped" end
+            roomDone      = true
+            roomSeenMatch = true
+            task.wait(2)
+
+        elseif roomDone then
+            -- Still in the Lobby with the job already done. Only re-arm after we
+            -- have really been inside a room and come back, otherwise the few
+            -- seconds between "created" and the teleport would start a new room.
+            if roomSeenMatch then
+                roomDone      = false
+                roomSeenMatch = false
+                roomStatus    = "Back in lobby — auto armed"
+            end
+            task.wait(2)
+
+        elseif autoRoomEnabled and GateRemote and not roomBusy then
             openAndCreate(roomGateChoice)
             task.wait(3)
+
         else
-            task.wait(0.5)
+            task.wait(IDLE_WAIT)
         end
     end
 end)
@@ -4722,7 +4755,14 @@ local AutoRoomToggle = RoomTab:Toggle({
     Icon  = "zap",
     Type  = "Checkbox",
     Value = false,
-    Callback = function(v) autoRoomEnabled = v end,
+    Callback = function(v)
+        autoRoomEnabled = v
+        if v then
+            -- switching it on by hand asks for one more attempt
+            roomDone   = false
+            roomStatus = "Auto armed"
+        end
+    end,
 })
 
 RoomTab:Button({
@@ -4730,7 +4770,14 @@ RoomTab:Button({
     Desc  = "loc:DSC_ROOMCREATE",
     Icon  = "plus",
     Callback = function()
-        task.spawn(function() openAndCreate(roomGateChoice) end)
+        task.spawn(function()
+            if not inLobby() then
+                roomStatus = "Already in a room"
+                return
+            end
+            roomDone = false
+            openAndCreate(roomGateChoice)
+        end)
     end,
 })
 
