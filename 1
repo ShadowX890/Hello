@@ -3597,15 +3597,70 @@ end)
 -- ═══════════════════════════════════════════════════
 --  STATE VARIABLES (UI-independent)
 -- ═══════════════════════════════════════════════════
--- Navigation
-local BIOMES = {
-    ["Crystal Cavern"] = Vector3.new(533.687,  23.874, 2236.390),
-    ["Death Forest"]   = Vector3.new(2862.588, 39.008, 1216.930),
-    ["Forest"]         = Vector3.new(869.349,  23.283,  710.348),
-    ["Snowfield"]      = Vector3.new(594.627,  26.963, -599.064),
-    ["Desert"]         = Vector3.new(-911.349, 49.760,    3.939),
-}
-local biomeSelected     = nil
+-- ── Navigation ────────────────────────────────────────────────
+-- Hardcoded coordinates broke when the map gained new biomes, so destinations
+-- are read from the map itself: workspace.Map.Prop.BiomeProps.<Biome>.<Prop>
+-- Each biome folder holds landmark props (Graveyard, Ruins2, Castle, ...).
+local biomeSelected = nil
+local biomePropList = {}     -- display label -> Instance
+local biomeLabels   = {}     -- sorted labels for the dropdown
+
+local function biomePropsFolder()
+    local map  = workspace:FindFirstChild("Map")
+    local prop = map and map:FindFirstChild("Prop")
+    return prop and prop:FindFirstChild("BiomeProps")
+end
+
+-- position of a prop, whether it is a Part, a Model, or a folder of parts
+local function propPosition(obj)
+    if not obj then return nil end
+    if obj:IsA("BasePart") then return obj.Position end
+    local ok, pivot = pcall(function() return obj:GetPivot().Position end)
+    if ok and typeof(pivot) == "Vector3" and pivot.Magnitude > 0.01 then
+        return pivot
+    end
+    local part = obj:FindFirstChildWhichIsA("BasePart", true)
+    return part and part.Position or nil
+end
+
+-- Walk each biome folder and keep whatever has a usable position.
+-- Some props nest one deeper (MagicForest.Castle.Castle), so recurse a little.
+local function collectBiomeProps()
+    local list, labels = {}, {}
+    local root = biomePropsFolder()
+    if not root then return list, labels end
+
+    local function addProp(biome, obj, depth)
+        if depth > 2 then return end
+        local pos = propPosition(obj)
+        if pos then
+            local label = biome .. " - " .. obj.Name
+            if not list[label] then
+                list[label] = obj
+                labels[#labels + 1] = label
+            end
+            return
+        end
+        -- no position of its own: look inside (folder wrapping the real prop)
+        for _, child in ipairs(obj:GetChildren()) do
+            addProp(biome, child, depth + 1)
+        end
+    end
+
+    for _, biome in ipairs(root:GetChildren()) do
+        for _, obj in ipairs(biome:GetChildren()) do
+            addProp(biome.Name, obj, 1)
+        end
+    end
+
+    table.sort(labels)
+    return list, labels
+end
+
+local function refreshBiomeProps()
+    biomePropList, biomeLabels = collectBiomeProps()
+    return biomeLabels
+end
 
 -- Class Shop
 local _autoBuyLoaded    = false
@@ -3971,6 +4026,7 @@ WindUI:Localization({
             ["DSC_073"] = "Teleport back to base",
             ["DSC_074"] = "Teleport to the selected chest",
             ["DSC_075"] = "Teleport to the selected zone",
+            ["DSC_BIOMEREFRESH"] = "Rescan the map for landmarks",
         },
         ["th"] = {
             -- Window
@@ -4221,6 +4277,7 @@ WindUI:Localization({
             ["DSC_073"] = "วาปกลับฐาน",
             ["DSC_074"] = "วาปไปหีบที่เลือก",
             ["DSC_075"] = "วาปไปโซนที่เลือก",
+            ["DSC_BIOMEREFRESH"] = "สแกนจุดวาปในแมพใหม่",
         },
     }
 })
@@ -4270,10 +4327,10 @@ local MainTab = Window:Tab({ Title = "Main", Icon = "house", Locked = false })
 MainTab:Select()
 MainTab:Section({ Title = "Navigation" })
 
-MainTab:Dropdown({
+local BiomeDropdown = MainTab:Dropdown({
     Title    = "Select Biome",
     Desc     = "loc:DSC_056",
-    Values   = { "Crystal Cavern", "Death Forest", "Forest", "Snowfield", "Desert" },
+    Values   = refreshBiomeProps(),
     Value    = "",
     Callback = function(sel)
         biomeSelected = (sel ~= "") and sel or nil
@@ -4294,9 +4351,30 @@ MainTab:Button({
             })
             return
         end
+
+        local target = biomePropList[biomeSelected]
+        local pos    = propPosition(target)
+        if not pos then
+            -- the prop may have streamed out; rebuild and try once more
+            refreshBiomeProps()
+            pcall(function() BiomeDropdown:Refresh(biomeLabels) end)
+            target = biomePropList[biomeSelected]
+            pos    = propPosition(target)
+        end
+
+        if not pos then
+            WindUI:Notify({
+                Title    = "Teleport",
+                Content  = "That spot is not loaded. Press Refresh Biomes.",
+                Duration = 4,
+                Icon     = "x",
+            })
+            return
+        end
+
         local root = getRoot()
         if not root then return end
-        root.CFrame = CFrame.new(BIOMES[biomeSelected])
+        root.CFrame = CFrame.new(pos + Vector3.new(0, 6, 0))
         WindUI:Notify({
             Title    = "Teleport",
             Content  = "Teleported to " .. biomeSelected,
@@ -4305,6 +4383,35 @@ MainTab:Button({
         })
     end,
 })
+
+MainTab:Button({
+    Title = "Refresh Biomes",
+    Desc  = "loc:DSC_BIOMEREFRESH",
+    Icon  = "refresh-cw",
+    Callback = function()
+        local vals = refreshBiomeProps()
+        pcall(function() BiomeDropdown:Refresh(vals) end)
+        WindUI:Notify({
+            Title    = "Teleport",
+            Content  = ("Found %d spots"):format(#vals),
+            Duration = 3,
+            Icon     = "map-pin",
+        })
+    end,
+})
+
+-- The map is not present in the Lobby, so fill the list in once it loads.
+task.spawn(function()
+    local last = -1
+    while true do
+        local vals = refreshBiomeProps()
+        if #vals > 0 and #vals ~= last then
+            last = #vals
+            pcall(function() BiomeDropdown:Refresh(vals) end)
+        end
+        task.wait(#vals > 0 and 15 or 3)
+    end
+end)
 
 MainTab:Button({
     Title = "Go Home",
