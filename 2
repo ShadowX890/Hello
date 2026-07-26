@@ -113,7 +113,8 @@ end
 -- ═══════════════════════════════════════════════════
 --  Anomaly detector
 --  workspace.ServerRig attribute "isAnomaly" (true = anomaly, false = human)
---  "visitorId" changes per visitor → used to notify once per knock
+--  "visitorId" changes per visitor → used to notify once per knock, and it is
+--  also the name of the visitor model in workspace (workspace.visitor_gym)
 -- ═══════════════════════════════════════════════════
 local function serverRig()
     return workspace:FindFirstChild("ServerRig")
@@ -194,6 +195,13 @@ local function refreshItemEsp()
     local seen = {}
     for _, o in ipairs(listCleanables()) do
         seen[o] = true
+        -- the game sometimes clears our Highlight (or the item was re-parented),
+        -- so treat a missing/dead highlight as "not tagged yet" and redo it
+        local existing = itemEspCache[o]
+        if existing and (not existing.Parent or existing.Adornee ~= o) then
+            pcall(function() existing:Destroy() end)
+            itemEspCache[o] = nil
+        end
         if not itemEspCache[o] then
             local ok, h = pcall(function()
                 local hl = Instance.new("Highlight")
@@ -284,8 +292,8 @@ end
 --  Replaces the old per-loop workspace:GetDescendants() calls.
 -- ═══════════════════════════════════════════════════
 local SCAN_INTERVAL = 1.0    -- seconds between scans
-local SCAN_DEPTH    = 5      -- how deep to walk
-local SCAN_CAP      = 250    -- max entries per cache
+local SCAN_DEPTH    = 6      -- how deep to walk
+local SCAN_CAP      = 400    -- max entries per cache
 
 local lastScanAt = 0
 
@@ -297,16 +305,24 @@ local function walk(root, depth, items, mons)
             if #mons < SCAN_CAP then mons[#mons + 1] = o end
         elseif ITEM_NAMES[n] and not CLEANING_TOOLS[n] then
             if #items < SCAN_CAP then items[#items + 1] = o end
+            -- an item model can still contain another item, so keep going
+            if o:IsA("Model") then walk(o, depth + 1, items, mons) end
         elseif o:IsA("Folder") or o:IsA("Model") then
             walk(o, depth + 1, items, mons)
         end
     end
 end
 
+-- An item that appears between scans used to stay un-highlighted for up to a
+-- second (and could be picked up before it ever showed). Watching Gameplay lets
+-- the next refresh pick it up immediately.
+local scanDirty = false
+
 -- force = ignore the timer (used right after toggling something on)
 local function runScan(force)
-    if not force and os.clock() - lastScanAt < SCAN_INTERVAL then return end
+    if not force and not scanDirty and os.clock() - lastScanAt < SCAN_INTERVAL then return end
     lastScanAt = os.clock()
+    scanDirty  = false
     local items, mons = {}, {}
     pcall(function() walk(gameplayFolder(), 0, items, mons) end)
     -- monsters may also sit outside Gameplay -> shallow sweep of workspace roots
@@ -321,6 +337,21 @@ local function runScan(force)
     end)
     itemCache, monsterCache = items, mons
 end
+
+-- mark dirty as soon as something relevant is added to the play area
+task.spawn(function()
+    local gp = gameplayFolder()
+    if not gp then
+        local ok = pcall(function() gp = workspace:WaitForChild("Gameplay", 30) end)
+        if not ok or not gp then return end
+    end
+    gp.DescendantAdded:Connect(function(o)
+        local n = o.Name
+        if MONSTER_NAMES[n] or (ITEM_NAMES[n] and not CLEANING_TOOLS[n]) then
+            scanDirty = true
+        end
+    end)
+end)
 
 local espCache = {}   -- [model] = Highlight
 local function clearEsp()
@@ -424,6 +455,325 @@ end
 
 
 -- ═══════════════════════════════════════════════════
+--  BACKGROUND SERVICES  (always on, no toggle)
+-- ═══════════════════════════════════════════════════
+local ProximityPromptService = game:GetService("ProximityPromptService")
+
+-- 1) No hold cooldown: completing the hold the moment it starts.
+ProximityPromptService.PromptButtonHoldBegan:Connect(function(prompt)
+    if typeof(fireproximityprompt) == "function" then
+        pcall(function() fireproximityprompt(prompt) end)
+    end
+end)
+
+-- 2) Instant prompts: strip the hold time from every prompt in the place,
+--    so anything that normally needs holding finishes at once.
+-- The game disables prompts it does not want used yet (the light switch is the
+-- obvious one) and puts them back to disabled on its own, so setting Enabled
+-- once does nothing. Keep a list and re-apply on a timer.
+local promptList = {}
+
+local function makeInstant(prompt)
+    if not prompt or not prompt:IsA("ProximityPrompt") then return end
+    promptList[prompt] = true
+    pcall(function()
+        prompt.Enabled              = true
+        prompt.HoldDuration         = 0
+        prompt.RequiresLineOfSight  = false
+        if prompt.MaxActivationDistance < 25 then
+            prompt.MaxActivationDistance = 25
+        end
+    end)
+end
+
+task.spawn(function()
+    for _, d in ipairs(workspace:GetDescendants()) do makeInstant(d) end
+end)
+workspace.DescendantAdded:Connect(makeInstant)
+
+-- re-apply, and drop prompts that were removed
+task.spawn(function()
+    while true do
+        for prompt in pairs(promptList) do
+            if prompt.Parent then
+                if not prompt.Enabled or prompt.HoldDuration > 0 then
+                    pcall(function()
+                        prompt.Enabled      = true
+                        prompt.HoldDuration = 0
+                    end)
+                end
+            else
+                promptList[prompt] = nil
+            end
+        end
+        task.wait(0.5)
+    end
+end)
+
+-- fire a prompt by name, wherever it lives (used by the light switch button)
+local function firePromptNamed(parentName)
+    local hit = 0
+    for prompt in pairs(promptList) do
+        local holder = prompt.Parent
+        if holder and holder.Name == parentName then
+            makeInstant(prompt)
+            if typeof(fireproximityprompt) == "function" then
+                pcall(function() fireproximityprompt(prompt) end)
+                hit = hit + 1
+            end
+        end
+    end
+    return hit
+end
+
+-- 3) Dialogue skip: the server drives visitor dialogue through
+--    ReplicatedStorage.Utils.Event (GlobalEventRemote). Answering the step the
+--    moment it arrives removes the wait between lines.
+local GlobalEventRemote = grab(function()
+    return ReplicatedStorage:WaitForChild("GlobalEventRemote", 10)
+end)
+
+if GlobalEventRemote then
+    GlobalEventRemote.OnClientEvent:Connect(function(name, ...)
+        if name == "visitor_dialogue" then
+            local step = ...
+            if step then
+                pcall(function() GlobalEventRemote:FireServer(name, step) end)
+            end
+        end
+    end)
+end
+
+-- ═══════════════════════════════════════════════════
+--  VISITOR ESP  (red = anomaly, green = human)
+-- ═══════════════════════════════════════════════════
+local visitorEsp = false
+local visitorHighlight = nil
+
+-- Highlights get a known name so they can be swept up even if the variable
+-- lost track of one (visitor swapped, model rebuilt, round restarted).
+local VISITOR_ESP_TAG = "SXH_VisitorESP"
+
+local function clearVisitorEsp()
+    if visitorHighlight then
+        pcall(function() visitorHighlight:Destroy() end)
+        visitorHighlight = nil
+    end
+    -- sweep any leftovers we created earlier
+    for _, o in ipairs(workspace:GetChildren()) do
+        if o.Name:sub(1, 8) == "visitor_" or o.Name == "ServerRig" then
+            for _, d in ipairs(o:GetDescendants()) do
+                if d.Name == VISITOR_ESP_TAG then
+                    pcall(function() d:Destroy() end)
+                end
+            end
+            local direct = o:FindFirstChild(VISITOR_ESP_TAG)
+            if direct then pcall(function() direct:Destroy() end) end
+        end
+    end
+end
+
+-- ServerRig only carries the attributes. The person at the door is a separate
+-- model sitting in workspace, named exactly like the visitorId attribute
+-- ("visitor_gym", "visitor_mib", ...), so that is what gets highlighted.
+local function visitorModel()
+    local rig = serverRig()
+    local vid = rig and rig:GetAttribute("visitorId")
+
+    local function usable(o)
+        return o and o:IsA("Model") and o:FindFirstChildWhichIsA("BasePart", true) ~= nil
+    end
+
+    -- 1) straight from the id
+    if vid then
+        local m = workspace:FindFirstChild(tostring(vid))
+        if usable(m) then return m end
+    end
+
+    -- 2) otherwise take whichever visitor_* model is in the world right now
+    for _, o in ipairs(workspace:GetChildren()) do
+        if o.Name:sub(1, 8) == "visitor_" and usable(o) then
+            return o
+        end
+    end
+
+    return nil
+end
+
+local function refreshVisitorEsp()
+    -- hard stop: never build a highlight while the toggle is off
+    if not visitorEsp then
+        clearVisitorEsp()
+        return
+    end
+
+    local rig = serverRig()
+    local isAnom = rig and rig:GetAttribute("isAnomaly")
+
+    if not rig or isAnom == nil then
+        clearVisitorEsp()
+        return
+    end
+
+    local target = visitorModel()
+    if not target then
+        clearVisitorEsp()
+        return
+    end
+
+    if visitorHighlight and visitorHighlight.Adornee ~= target then
+        clearVisitorEsp()
+    end
+
+    if not visitorHighlight then
+        local ok, hl = pcall(function()
+            local h = Instance.new("Highlight")
+            h.Name = VISITOR_ESP_TAG
+            h.FillTransparency = 0.4
+            h.DepthMode = Enum.HighlightDepthMode.AlwaysOnTop
+            h.Adornee = target
+            -- parent under CoreGui-safe container: the model itself is fine and
+            -- gets cleaned up with it
+            h.Parent = target
+            return h
+        end)
+        if ok then visitorHighlight = hl else return end
+    end
+
+    local red   = Color3.fromRGB(255, 45, 45)
+    local green = Color3.fromRGB(60, 230, 90)
+    local c = (isAnom == true) and red or green
+    pcall(function()
+        visitorHighlight.FillColor = c
+        visitorHighlight.OutlineColor = c
+    end)
+end
+
+-- ═══════════════════════════════════════════════════
+--  PLAYER  (tp walk / noclip / fly)
+-- ═══════════════════════════════════════════════════
+local RunService       = game:GetService("RunService")
+local UserInputService  = game:GetService("UserInputService")
+
+local tpWalkEnabled = false
+local tpWalkSpeed   = 3      -- studs added per frame
+
+local noclipEnabled = false
+local noclipSaved   = {}     -- [BasePart] = true  (parts we actually switched off)
+
+local flyEnabled = false
+local flySpeed   = 60
+
+local function humanoid()
+    local c = LocalPlayer.Character
+    return c and c:FindFirstChildOfClass("Humanoid")
+end
+
+-- ── TP Walk ───────────────────────────────────────────────────
+-- Moves the root a little every frame instead of raising WalkSpeed, so
+-- Humanoid.WalkSpeed still reads as the normal value.
+RunService.Heartbeat:Connect(function()
+    if not tpWalkEnabled or flyEnabled then return end
+    local hum  = humanoid()
+    local root = getRoot()
+    if not hum or not root then return end
+    local dir = hum.MoveDirection
+    if dir.Magnitude < 0.1 then return end
+    pcall(function()
+        root.CFrame = root.CFrame + dir * tpWalkSpeed
+    end)
+end)
+
+-- ── Noclip ────────────────────────────────────────────────────
+-- Only parts that were solid get switched off, and only those get restored,
+-- so parts the game keeps non-solid stay that way.
+local function applyNoclip()
+    local c = LocalPlayer.Character
+    if not c then return end
+    for _, part in ipairs(c:GetDescendants()) do
+        if part:IsA("BasePart") and part.CanCollide then
+            noclipSaved[part] = true
+            pcall(function() part.CanCollide = false end)
+        end
+    end
+end
+
+local function restoreNoclip()
+    for part in pairs(noclipSaved) do
+        if part and part.Parent then
+            pcall(function() part.CanCollide = true end)
+        end
+    end
+    noclipSaved = {}
+end
+
+RunService.Stepped:Connect(function()
+    if noclipEnabled then applyNoclip() end
+end)
+
+-- ── Fly ───────────────────────────────────────────────────────
+local flyBV, flyBG = nil, nil
+
+local function stopFly()
+    if flyBV then pcall(function() flyBV:Destroy() end) flyBV = nil end
+    if flyBG then pcall(function() flyBG:Destroy() end) flyBG = nil end
+    local hum = humanoid()
+    if hum then pcall(function() hum.PlatformStand = false end) end
+end
+
+local function startFly()
+    local root = getRoot()
+    local hum  = humanoid()
+    if not root or not hum then return end
+    stopFly()
+
+    flyBV = Instance.new("BodyVelocity")
+    flyBV.MaxForce = Vector3.new(1, 1, 1) * 9e9
+    flyBV.Velocity = Vector3.zero
+    flyBV.Parent = root
+
+    flyBG = Instance.new("BodyGyro")
+    flyBG.MaxTorque = Vector3.new(1, 1, 1) * 9e9
+    flyBG.P = 9e4
+    flyBG.CFrame = root.CFrame
+    flyBG.Parent = root
+
+    pcall(function() hum.PlatformStand = true end)
+end
+
+RunService.Heartbeat:Connect(function()
+    if not flyEnabled then return end
+    local root = getRoot()
+    local hum  = humanoid()
+    local cam  = workspace.CurrentCamera
+    if not root or not hum or not cam or not flyBV then return end
+
+    -- movement comes from the humanoid, so keyboard and mobile both work
+    local dir = hum.MoveDirection
+    local move = Vector3.zero
+    if dir.Magnitude > 0.1 then move = dir end
+
+    -- vertical: jump key / space lifts, shift lowers
+    local up = 0
+    if UserInputService:IsKeyDown(Enum.KeyCode.Space) then up = up + 1 end
+    if UserInputService:IsKeyDown(Enum.KeyCode.LeftShift) then up = up - 1 end
+
+    local vel = (move + Vector3.new(0, up, 0))
+    if vel.Magnitude > 0 then vel = vel.Unit * flySpeed else vel = Vector3.zero end
+
+    pcall(function()
+        flyBV.Velocity = vel
+        if flyBG then flyBG.CFrame = cam.CFrame end
+    end)
+end)
+
+LocalPlayer.CharacterAdded:Connect(function()
+    noclipSaved = {}
+    task.wait(1)
+    if flyEnabled then startFly() end
+end)
+
+-- ═══════════════════════════════════════════════════
 --  State
 -- ═══════════════════════════════════════════════════
 local selectedMode  = "Infinite"
@@ -473,7 +823,7 @@ end)
 -- ═══════════════════════════════════════════════════
 --  UI  (Rayfield)  — kept separate from the logic above
 -- ═══════════════════════════════════════════════════
-local Rayfield = loadstring(game:HttpGet("https://sirius.menu/rayfield"))()
+local Rayfield = loadstring(game:HttpGet('https://sirius.menu/rayfield'))()
 
 local Window = Rayfield:CreateWindow({
     Name = "Home Alone — Shadow X Hub",
@@ -571,7 +921,7 @@ LobbyTab:CreateButton({
 })
 
 -- Detector tab -------------------------------------------------
-local DetectorTab = Window:CreateTab("Detector", 4483362458)
+local DetectorTab = Window:CreateTab("Detector", "search")
 
 DetectorTab:CreateSection("Anomaly Detector")
 
@@ -587,6 +937,16 @@ DetectorTab:CreateToggle({
 local DetectorParagraph = DetectorTab:CreateParagraph({
     Title = "Visitor",
     Content = "Detector is off.",
+})
+
+DetectorTab:CreateToggle({
+    Name = "Visitor ESP",
+    CurrentValue = false,
+    Flag = "VisitorESP",
+    Callback = function(v)
+        visitorEsp = v
+        if v then refreshVisitorEsp() else clearVisitorEsp() end
+    end,
 })
 
 DetectorTab:CreateSection("Monster ESP")
@@ -607,7 +967,7 @@ local MonsterParagraph = DetectorTab:CreateParagraph({
 })
 
 -- Equipment tab ------------------------------------------------
-local ShopTab = Window:CreateTab("Equipment", 4483362458)
+local ShopTab = Window:CreateTab("Equipment", "circle-dollar-sign")
 
 ShopTab:CreateSection("Shop (sanity boosts)")
 
@@ -656,7 +1016,7 @@ ShopTab:CreateButton({
 })
 
 -- Cleaning tab -------------------------------------------------
-local CleanTab = Window:CreateTab("Cleaning", 4483362458)
+local CleanTab = Window:CreateTab("Cleaning", "user")
 
 CleanTab:CreateSection("Item ESP")
 
@@ -682,12 +1042,99 @@ local TaskParagraph = CleanTab:CreateParagraph({
     Content = "Loading...",
 })
 
+-- Player tab ---------------------------------------------------
+local PlayerTab = Window:CreateTab("Player", "user")
+
+PlayerTab:CreateSection("Movement")
+
+PlayerTab:CreateToggle({
+    Name = "TP Walk",
+    CurrentValue = false,
+    Flag = "TpWalk",
+    Callback = function(v) tpWalkEnabled = v end,
+})
+
+PlayerTab:CreateSlider({
+    Name = "TP Walk Speed",
+    Range = { 1, 15 },
+    Increment = 1,
+    CurrentValue = 3,
+    Flag = "TpWalkSpeed",
+    Callback = function(v) tpWalkSpeed = v or 3 end,
+})
+
+PlayerTab:CreateToggle({
+    Name = "Noclip",
+    CurrentValue = false,
+    Flag = "Noclip",
+    Callback = function(v)
+        noclipEnabled = v
+        if v then applyNoclip() else restoreNoclip() end
+    end,
+})
+
+PlayerTab:CreateSection("House")
+
+PlayerTab:CreateButton({
+    Name = "Toggle Light Switch",
+    Callback = function()
+        local n = firePromptNamed("LightSwitch")
+        if n > 0 then
+            Rayfield:Notify({ Title = "Light Switch", Content = "Triggered " .. n .. " switch(es).", Duration = 3 })
+        else
+            Rayfield:Notify({
+                Title = "Light Switch",
+                Content = "No LightSwitch prompt found yet — get inside the house first.",
+                Duration = 4,
+            })
+        end
+    end,
+})
+
+PlayerTab:CreateButton({
+    Name = "Force Enable All Prompts",
+    Callback = function()
+        local n = 0
+        for _, d in ipairs(workspace:GetDescendants()) do
+            if d:IsA("ProximityPrompt") then makeInstant(d) n = n + 1 end
+        end
+        Rayfield:Notify({ Title = "Prompts", Content = "Re-enabled " .. n .. " prompts.", Duration = 3 })
+    end,
+})
+
+PlayerTab:CreateSection("Fly")
+
+PlayerTab:CreateToggle({
+    Name = "Fly",
+    CurrentValue = false,
+    Flag = "Fly",
+    Callback = function(v)
+        flyEnabled = v
+        if v then startFly() else stopFly() end
+    end,
+})
+
+PlayerTab:CreateSlider({
+    Name = "Fly Speed",
+    Range = { 10, 300 },
+    Increment = 5,
+    CurrentValue = 60,
+    Flag = "FlySpeed",
+    Callback = function(v) flySpeed = v or 60 end,
+})
+
+PlayerTab:CreateParagraph({
+    Title = "Controls",
+    Content = "Fly: movement keys steer, Space rises, Left Shift descends.\nTP Walk moves you without changing WalkSpeed.",
+})
+
 -- ═══════════════════════════════════════════════════
 --  Anomaly detector loop — notify once per visitor, keep paragraph live
 -- ═══════════════════════════════════════════════════
 task.spawn(function()
     local lastVisitor = nil
     while true do
+        if visitorEsp then refreshVisitorEsp() end
         if anomalyDetect then
             local isAnom, vid = readVisitor()
             if vid == nil then
